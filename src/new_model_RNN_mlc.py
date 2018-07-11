@@ -1,0 +1,477 @@
+import pandas as pd
+
+import os
+
+os.environ['PYTHONHASHSEED'] = '2018'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+from keras.models import Model, Sequential
+from keras.layers import Dense, Input, Dropout, MaxPooling1D, Conv1D
+from keras.layers import LSTM, Lambda, Embedding, Concatenate, Masking, Add, Multiply, Subtract
+from keras.layers import TimeDistributed, Bidirectional
+from keras.utils import Sequence, to_categorical
+from keras.utils import plot_model
+# from keras.losses import categorical_crossentropy
+from keras import initializers
+import random as rn
+import numpy as np
+
+import tensorflow as tf
+# tf.set_random_seed(2018)
+from keras import backend as K
+from keras.layers.normalization import BatchNormalization
+from keras.engine.topology import Layer, InputSpec
+from mpl_toolkits.mplot3d import Axes3D
+from multiprocessing import Process
+# import tensorflow as tf
+
+import re
+import keras.callbacks
+import sys
+import pickle as pkl
+# from numpy.random import seed
+# from tensorflow import set_random_seed
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+import matplotlib.pyplot as plt
+from numpy import around
+from keras.utils import plot_model
+from scipy.sparse import load_npz
+from sklearn.cluster import KMeans
+import itertools, tqdm
+# rn.seed(2018)
+# seed(2018)
+# set_random_seed(2018)
+
+verbose = 0
+
+
+# def generate_layer_sizes(w_min, w_max):
+#     '''generate random neural network layer size'''
+#
+#     return int(np.random.uniform(w_min, w_max))
+
+
+def m_crossentropy(y_true, y_pred):
+    loss =  K.sum(K.mean(K.binary_crossentropy(y_true, y_pred), -1))
+
+    condition = K.greater(K.sum(y_true), 0)
+    return K.switch(condition, loss, K.zeros_like(loss))
+
+
+def m_accuracy(y_true, y_pred):
+    # acc =  K.cast(K.equal(K.argmax(y_true, axis=-1),
+    #                       K.argmax(y_pred, axis=-1)),
+    #               K.floatx())
+    # condition = K.greater(K.sum(y_true), 0)
+    # return K.switch(condition, acc, K.zeros_like(acc))
+
+    treshold = 0
+    mask = Lambda(lambda x: K.greater_equal(x, treshold))(y_true)
+    mask = Lambda(lambda x: K.cast(x, 'float32'))(mask)
+    pred_label = Lambda(lambda x: x * mask)(y_pred)
+    true_label = Lambda(lambda x: x * mask)(y_true)
+    return K.mean(K.all(K.equal(true_label, K.round(pred_label)), axis=-1))
+
+
+
+# def load_preprocessed(dataset):
+def parse_index_file(filename):
+    """Parse index file."""
+    index = []
+    for line in open(filename):
+        index.append(int(line.strip()))
+    return index
+
+
+def sample_mask(idx, l):
+    """Create mask."""
+    mask = np.zeros(l)
+    mask[idx] = 1
+    return np.array(mask, dtype=np.bool)
+
+
+def load_cite_data(dataset_str):
+    """Load data."""
+    names = ['x', 'y', 'tx', 'ty', 'allx', 'ally', 'graph']
+    objects = []
+    for i in range(len(names)):
+        with open("../data/ind.{}.{}".format(dataset_str, names[i]), 'rb') as f:
+            if sys.version_info > (3, 0):
+                objects.append(pkl.load(f, encoding='latin1'))
+            else:
+                objects.append(pkl.load(f))
+
+    x, y, tx, ty, allx, ally, graph = tuple(objects)
+
+    test_idx_reorder = parse_index_file("../data/ind.{}.test.index".format(dataset_str))
+    test_idx_range = np.sort(test_idx_reorder)
+
+    if dataset_str == 'citeseer':
+        # Fix citeseer dataset (there are some isolated nodes in the graph)
+        # Find isolated nodes, add them as zero-vecs into the right position
+        test_idx_range_full = range(min(test_idx_reorder), max(test_idx_reorder) + 1)
+        ty_extended = np.zeros((len(test_idx_range_full), y.shape[1]))
+        ty_extended[test_idx_range - min(test_idx_range), :] = ty
+        ty = ty_extended
+
+    labels = np.vstack((ally, ty))
+    labels[test_idx_reorder, :] = labels[test_idx_range, :]
+    idx_test = test_idx_range.tolist()
+    idx_train = range(len(y))
+    idx_val = range(len(y), len(y) + 500)
+
+    train_mask = sample_mask(idx_train, labels.shape[0])
+    val_mask = sample_mask(idx_val, labels.shape[0])
+    test_mask = sample_mask(idx_test, labels.shape[0])
+    u_mask = ~(train_mask | test_mask | val_mask)
+
+    features = load_npz('../features/{}.npz'.format(dataset_str)).toarray()
+
+    return (features, labels, np.where(train_mask == True)[0] ,np.where(val_mask == True)[0], np.where(test_mask == True)[0], np.where(u_mask == True)[0])
+
+
+def clean(s):
+    return re.sub(r'[^\x00-\x7f]', r'', s)
+
+
+# record history of training
+class LossHistory(keras.callbacks.Callback):
+    def on_train_begin(self, logs={}):
+        self.losses = []
+        self.accuracies = []
+
+    def on_batch_end(self, batch, logs={}):
+        self.losses.append(logs.get('loss'))
+        self.accuracies.append(logs.get('acc'))
+
+
+class DataSequence(Sequence):
+
+    def __init__(self, x_l, x_ul, y_l, y_ul, batch_size):
+        self.xl, self.xu, self.y, self.y_ul = x_l, x_ul, y_l, y_ul
+        self.epoch = 0
+        self.labeled_size = self.xl.shape[0]
+        self.batch_size = batch_size
+        self.steps_l = int(np.ceil(len(self.xl) / float(self.batch_size)))
+        # print(x_ul.shape[0])
+
+        # if (self.labeled_size%batch_size) == 0:
+        #     self.steps_taken = np.floor(self.xl.shape[0] / batch_size )
+        # else:
+        #     self.steps_taken = np.floor(self.xl.shape[0] / batch_size ) + 1
+
+    def __len__(self):
+        return int(np.ceil(len(self.xl) / float(self.batch_size)) + np.ceil(len(self.xu) / float(self.batch_size)))
+
+    def __getitem__(self, idx):
+        # print(idx, self.steps_taken)
+        if idx < self.steps_l:
+            batch_x = self.xl[idx * self.batch_size:(idx + 1) * self.batch_size]
+            batch_y = self.y[idx * self.batch_size:(idx + 1) * self.batch_size]
+        else:
+            batch_x = self.xu[(idx - self.steps_l) * self.batch_size:((idx - self.steps_l) + 1) * self.batch_size]
+            # batch_y = self.y_ul[(idx - self.steps_l) * self.batch_size:((idx - self.steps_l) + 1) * self.batch_size]
+            batch_y = -1*np.ones((batch_x.shape[0], self.y.shape[1]))
+            # self.steps_taken += 1
+        # print(batch_y.shape)
+
+        # batch_p = self.p[idx * self.batch_size:(idx + 1) * self.batch_size]
+        # batch_p _  = self.model.predict(x, verbose=0)
+
+        return batch_x, batch_y
+
+    # def on_epoch_begin(self):
+    #     if self.epoch % update_interval == 0:
+    #         _, q = model.predict(X_tu, batch_size=128)
+    #         self.p = target_distribution(q)
+    #     self.epoch += 1
+
+def sampling(args):
+    """Reparameterization trick by sampling fr an isotropic unit Gaussian.
+    # Arguments:
+        args (tensor): mean and log of variance of Q(z|X)
+    # Returns:
+        z (tensor): sampled latent vector
+    """
+    epsilon_std = 1.0
+    z_mean, z_log_var = args
+    batch = K.shape(z_mean)[0]
+    dim = K.int_shape(z_mean)[1]
+    # by default, random_normal has mean=0 and std=1.0
+    epsilon = K.random_normal(shape=(batch, dim), mean=0., stddev=epsilon_std)
+    return z_mean + K.exp(0.5 * z_log_var) * epsilon
+
+def G2V(file_name, num_walks, walk_length, _dataset, X, cv_splits, features, y,l_dim,n_clusters, is_supervised=True):
+
+
+    maxlen = walk_length
+    max_sentences = num_walks
+
+    intermediate_dim = n_clusters * 2
+    latent_dim = n_clusters
+    batch_size = 128
+    epsilon_std = 1.0
+    best = [-1]
+    best_config = []
+    fold = 4
+    rng = np.random.RandomState(seed=2018)
+
+    acc, f1_micro, precision_micro, recall_micro = 0, 0, 0, 0
+
+    f1_macro, precision_macro, recall_macro = 0, 0, 0
+    for i in range(fold):
+        u_mask = []
+        test_mask = []
+        for j in range(len(cv_splits)):
+            if j == i:
+                train_mask = cv_splits[j]
+            elif j == ((i + 1) % fold):
+                val_mask = cv_splits[j]
+            elif j == ((i + 2) % fold):
+                test_mask = cv_splits[j]
+            else:
+                u_mask += cv_splits[j]
+
+        rng.shuffle(train_mask)
+        rng.shuffle(val_mask)
+        rng.shuffle(u_mask)
+        rng.shuffle(test_mask)
+
+        # print(len(train_mask), len(val_mask),len(test_mask), len(u_mask))
+        # exit()
+        X_train, y_train = X[train_mask, :], y[train_mask, :]
+        X_test, y_test = X[test_mask, :], y[test_mask, :]
+        X_ul, y_ul = X[u_mask, :], y[u_mask, :]
+        X_v, y_v = X[val_mask, :], y[val_mask, :]
+
+        filter_length = [3, 2, 2]
+        nb_filter = [12, 6, 12]
+        pool_length = 2
+
+        # l_dim_arr = [64]#[64,128,32,256]
+        # document input
+        search_iter = 1
+        best = [-1]
+        best_config = []
+        n_labels = y_train.shape[1]
+        # n_clusters_arr = [n_labels]#[n_labels, 10]
+        # configs = list(itertools.product(l_dim_arr, n_clusters_arr))
+
+        r_alpha = 0.9
+        rn.seed(2018)
+        np.random.seed(2018)
+        # tf.reset_default_graph()
+        K.clear_session()
+        # rn.seed(2018)
+        # seed(2018)
+        tf.set_random_seed(2018)
+        # rn.setstate(old_state)
+        # np.random.set_state(st0)
+        gpu_options = tf.GPUOptions(allow_growth=True)
+        sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
+        K.set_session(sess)
+
+        with sess.as_default():
+            document = Input(shape=(max_sentences, maxlen), dtype='int64')
+
+            # sentence input
+            in_sentence = Input(shape=(maxlen,), dtype='int64')
+            # char indices to one hot matrix, 1D sequence to 2D
+            # embedded = Lambda(binarize, output_shape=binarize_outshape)(in_sentence)
+            embedded = Embedding(len(X),
+                                 features.shape[1],
+                                 weights=[features],
+                                 # input_length=MAX_SEQUENCE_LENGTH,
+                                 trainable=False)(in_sentence)
+
+            bi_lstm_sent = \
+                Bidirectional(LSTM(l_dim, return_sequences=False, dropout=0.5, recurrent_dropout=0.5, implementation=1))(
+                    embedded)
+
+            sent_encode = Dropout(0.15)(bi_lstm_sent)
+            # sentence encoder
+            encoder = Model(inputs=in_sentence, outputs=sent_encode)
+
+            encoded = TimeDistributed(encoder)(document)
+            # encoded: sentences to bi-lstm for document encoding
+            b_lstm_doc = \
+                Bidirectional(LSTM(l_dim, return_sequences=False, dropout=0.5, recurrent_dropout=0.5, implementation=1))(
+                    encoded)
+
+            output_lstm = Dropout(0.15)(b_lstm_doc)
+            output_dense = Dense(l_dim, activation='relu')(output_lstm)
+            # output_dense = Dropout(0.1)(output_dense)
+
+            if is_supervised == False:
+                decoder = Sequential([
+                    Dense(intermediate_dim, input_dim=latent_dim, activation='relu'),
+                    # Dense(int(l_dim/2), activation='relu'),
+                    Dense(l_dim, activation='relu')
+                ], name="decoder")
+
+                encoder = Sequential([
+                    # Dense(int(l_dim/2), input_dim=l_dim, activation='relu'),
+                    # Dense(intermediate_dim, input_dim=l_dim, activation='relu')
+                    Dense(intermediate_dim, input_dim=l_dim, activation='relu')
+                ], name="encoder")
+
+                h = encoder(output_dense)
+
+                z_mu = Dense(latent_dim)(h)
+                z_log_var = Dense(latent_dim)(h)
+
+                z = Lambda(sampling, output_shape=(latent_dim,), name='z')([z_mu, z_log_var])
+
+                x_pred = decoder(z)
+
+
+                output = Concatenate(axis=-1)([output_dense, z_mu])
+                # output = Dense(l_dim+n_clusters, activation='relu')(output)
+
+            else:
+                output = output_dense
+
+            output = Dense(y.shape[1], activation='sigmoid')(output)
+
+            def vae_loss(y_true, y_pred):
+                alpha = 0.99
+                sup_loss = m_crossentropy(y_true,y_pred)
+                if is_supervised:
+                    return sup_loss
+                else:
+                    xent_loss = keras.losses.mse(output_dense, x_pred)
+                    kl_loss = - 0.5 * K.mean(1 + z_log_var - K.square(z_mu) - K.exp(z_log_var), axis=-1)
+                    return (alpha*sup_loss) + (1-alpha)*(xent_loss + kl_loss)
+
+            model = Model(inputs=[document], outputs=output)
+            # plot_model(model, to_file='G2Vmodel.png')
+            # exit()
+            # layer_name = 'dense1'
+            # Dlayer_model = Model(inputs=model.input,
+            #                                  outputs=model.get_layer(layer_name).output)
+
+
+            # model.summary()
+            # plot_model(model, to_file='Images/model.png')
+            # exit()
+
+            data_sequence_train = DataSequence(X_train, X_ul, y_train, y_ul, 128)
+
+            # if checkpoint:
+            #     model.load_weights(checkpoint)
+            #
+            # file_name = _dataset + 'g2v1'
+            check_cb = keras.callbacks.ModelCheckpoint('../checkpoint/' + file_name + '.hdf5',
+                                                       monitor='val_loss',
+                                                       verbose=0, save_best_only=True, mode='min')
+            earlystop_cb = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, verbose=verbose, mode='auto')
+            history = LossHistory()
+            optimizer = keras.optimizers.Adam(lr=0.001)
+            # optimizer = keras.optimizers.Adagrad(lr=0.001)
+
+            model.compile(loss=vae_loss, optimizer=optimizer, metrics=[m_accuracy])
+            model.fit_generator(data_sequence_train, validation_data=(X_v, y_v), verbose=verbose,
+                      epochs=200, shuffle=False, callbacks=[earlystop_cb, check_cb])
+
+            model.load_weights('../checkpoint/' + file_name + '.hdf5')
+
+            to_plot = False
+
+            if is_supervised == False and to_plot == True:
+                encode = Model(inputs=[document], outputs=z_mu)
+                a = encode.predict(X_test,batch_size=128)
+                from scipy.sparse import csr_matrix
+                b = csr_matrix((np.ones(a.shape[0]), (y_test.argmax(-1), a.argmax(-1)))).toarray()
+                print(b)
+                fig = plt.figure()
+                ax = fig.add_subplot(111, projection='3d')
+                ax.scatter(a[:,0], a[:,1], a[:,2],c=y_test.argmax(-1))
+                ax.set_title(file_name)
+
+                # plt.figure(1)
+                # plt.scatter(a[:, 0], a[:, 1], c=y_test.argmax(-1))
+                plt.show()
+
+            predY = model.predict(X_test,batch_size=128)
+
+        acc += accuracy_score(y_test, np.round(predY))
+        # print(acc)
+
+        f1_micro += f1_score(y_test, np.round(predY), average='micro')
+        precision_micro += precision_score(y_test, np.round(predY), average='micro')
+        recall_micro += recall_score(y_test, np.round(predY), average='micro')
+
+        f1_macro += f1_score(y_test, np.round(predY), average='macro')
+        precision_macro += precision_score(y_test, np.round(predY), average='macro')
+        recall_macro += recall_score(y_test, np.round(predY), average='macro')
+
+    acc /= fold
+
+    f1_micro /= fold
+    precision_micro /= fold
+    recall_micro /= fold
+
+    f1_macro /= fold
+    precision_macro /= fold
+    recall_macro /= fold
+
+    if f1_macro > best[0]:
+        best = [f1_macro, precision_macro, recall_macro, f1_micro, precision_micro, recall_micro, acc]
+        best_config = [[l_dim, n_clusters]]
+    elif f1_macro == best[0]:
+        best_config.append([l_dim, n_clusters])
+
+        # print(best, best_config)
+        # exit()
+    return best, best_config
+
+    #     if acc > best[0]:
+    #         best = [acc]
+    #         best_config = [[l_dim,n_clusters]]
+    #     elif acc == best[0]:
+    #         best_config.append([l_dim,n_clusters] )
+    #
+    # return best, best_config
+
+    # print(model.history.keys())
+    # summarize history for accuracy
+    # plt.figure(1)
+    # plt.plot(tr_acc/n_split)
+    # plt.plot(val_acc/n_split)
+    # plt.title('{} model accuracy'.format(str(sys.argv[1]).split("_all_")[-1]))
+    # plt.ylabel('accuracy')
+    # plt.xlabel('epoch')
+    # plt.legend(['train', 'test'], loc='upper left')
+    # # plt.show()
+    # # summarize history for loss
+    # plt.figure(2)
+    # plt.plot(tr_loss/n_split)
+    # plt.plot(val_loss/n_split)
+    # plt.title('{} model loss'.format(str(sys.argv[1]).split("_all_")[-1]))
+    # plt.ylabel('loss')
+    # plt.xlabel('epoch')
+    # plt.legend(['train', 'test'], loc='upper left')
+    # plt.show()
+
+    # print (str(sys.argv[1]))
+
+    ''' my_df = pd.DataFrame(history.accuracies)
+    my_df.to_csv('accuracies.csv', index=False, header=False)
+
+    my_df = pd.DataFrame(history.losses)
+    my_df.to_csv('losses.csv', index=False, header=False)'''
+
+    '''plt.plot(history.accuracies)
+    plt.ylabel('Batch_per_epoch')
+    plt.ylabel('Accuraccy')
+    plt.show()
+    plt.plot(history.losses)
+    plt.ylabel('Batch_per_epoch')
+    plt.ylabel('Loss')
+    plt.show()'''
+
+    # just showing access to the history object
+    # print metrics.f1s
+    # print history.losses
+    # print history.accuracies

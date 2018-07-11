@@ -1,0 +1,2 @@
+CMDLINE python main.py --input ../graph/ --output ../emb/ --p 1 --q 1 --walk-length 20 --num-walks 10 --dataset 2 --l_type cluster --su
+MEM 0.468750 1530826466.5418
