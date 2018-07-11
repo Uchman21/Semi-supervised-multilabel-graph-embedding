@@ -6,7 +6,7 @@ all: $(MAIN)
 
 # COMPILE
 $(MAIN): $(MAIN).cpp $(DEPH) $(DEPCPP) $(EXSNAP)/Snap.o 
-	$(CC) $(CXXFLAGS) -o $(MAIN) $(MAIN).cpp $(DEPCPP) $(EXSNAP)/Snap.o -I$(EXSNAP) -I$(EXGLIB) -I$(CPython) $(LDFLAGS) $(LIBS) -lpython2.7
+	$(CC) $(CXXFLAGS) -o $(MAIN) $(MAIN).cpp $(DEPCPP) $(EXSNAP)/Snap.o -I$(EXSNAP) -I$(EXGLIB) -I$(EXDEP) -I$(CPython) $(LDFLAGS) $(LIBS) -lpython2.7
 
 $(EXSNAP)/Snap.o: 
 	make -C $(EXSNAP)
